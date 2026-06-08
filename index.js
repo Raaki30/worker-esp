@@ -3,7 +3,8 @@ require("dotenv").config();
 const amqp = require("amqplib");
 const { createClient } = require("@supabase/supabase-js");
 
-const QUEUE = "parking_queue";
+// NAMA QUEUE DISAMAKAN DENGAN WEBSOCKET SERVER
+const QUEUE = "parking_queue"; 
 
 // Supabase client
 const supabase = createClient(
@@ -37,39 +38,46 @@ async function startWorker() {
       try {
         // Parse incoming message
         const data = JSON.parse(msg.content.toString());
+        console.log("Incoming message slots count:", data.slots ? data.slots.length : 0);
 
-        console.log("Incoming message:", data);
+        // Pastikan format JSON dari ESP32 benar (memiliki array 'slots')
+        if (data.slots && Array.isArray(data.slots)) {
+          
+          // Mapping data array untuk Bulk Upsert
+          const payloadToDb = data.slots.map((slot) => ({
+            parking_id: slot.parking_id,
+            area_id: slot.area_id,
+            level_id: slot.level_id,
+            zone_id: slot.zone_id,
+            slot_number: slot.slot_number,
+            is_filled: slot.is_filled,
+            updated_at: new Date(),
+          }));
 
-        // Insert / update database
-        const { error } = await supabase
-          .from("parking_slots")
-          .upsert(
-            {
-              parking_id: data.parking_id,
-              area_id: data.area_id,
-              level_id: data.level_id,
-              zone_id: data.zone_id,
-              slot_number: data.slot_number,
-              is_filled: data.is_filled,
-              updated_at: new Date(),
-            },
-            {
-              onConflict:
-                "parking_id,area_id,level_id,zone_id,slot_number",
-            }
-          );
+          // Insert / update database sekaligus (Bulk Upsert)
+          const { error } = await supabase
+            .from("parking_slots")
+            .upsert(payloadToDb, {
+              onConflict: "parking_id,area_id,level_id,zone_id,slot_number",
+            });
 
-        if (error) {
-          console.error("Supabase error:", error);
+          if (error) {
+            console.error("❌ Supabase error:", error);
+          } else {
+            console.log(`✅ Database updated successfully: ${payloadToDb.length} slots`);
+          }
+          
         } else {
-          console.log("Database updated successfully");
+          console.warn("⚠️ Invalid payload format. 'slots' array is missing.");
         }
 
-        // Acknowledge message
+        // Acknowledge message agar dihapus dari antrean RabbitMQ
         channel.ack(msg);
 
       } catch (err) {
         console.error("Worker processing error:", err);
+        // Tetap acknowledge jika JSON corrupt agar antrean tidak macet
+        channel.ack(msg); 
       }
     });
 
