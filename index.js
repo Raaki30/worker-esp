@@ -3,16 +3,16 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const WebSocket = require("ws"); // Di-require secara spesifik untuk injeksi ke Supabase
+const WebSocket = require("ws"); // Wajib di-require spesifik untuk Supabase
 const amqp = require("amqplib");
 const { createClient } = require("@supabase/supabase-js");
 
-// PENCEGAHAN CRASH 1: Cek apakah variabel dari Back4App sudah masuk
+// PENCEGAHAN CRASH 1: Validasi Environment Variables
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-  console.error("🔥 FATAL ERROR: SUPABASE_URL atau SUPABASE_KEY belum terbaca dari server!");
+  console.error("🔥 FATAL ERROR: SUPABASE_URL atau SUPABASE_KEY belum diisi di Railway!");
 }
 if (!process.env.RABBITMQ_URL) {
-  console.error("🔥 FATAL ERROR: RABBITMQ_URL belum terbaca dari server!");
+  console.error("🔥 FATAL ERROR: RABBITMQ_URL belum diisi di Railway!");
 }
 
 const QUEUE = "parking_queue"; 
@@ -21,23 +21,24 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// PENCEGAHAN CRASH 2: Konfigurasi Supabase khusus untuk Node.js 20+
+// PENCEGAHAN CRASH 2: Konfigurasi Supabase dengan injeksi WebSocket
+// (Railway menggunakan Node 20+, sehingga butuh injeksi ini agar tidak crash)
 const supabase = createClient(
   process.env.SUPABASE_URL || "https://dummy.supabase.co", 
   process.env.SUPABASE_KEY || "dummy_key",
   {
     auth: {
-      persistSession: false // Wajib false untuk lingkungan server/backend
+      persistSession: false 
     },
     realtime: {
-      transport: WebSocket // Solusi jitu untuk error "Node.js 20 without native WebSocket"
+      transport: WebSocket 
     }
   }
 );
 
-// Healthcheck endpoint (Wajib untuk Back4App)
+// Endpoint Healthcheck (Penting: Ini yang dicek oleh bot Railway agar container tidak di-stop)
 app.get("/", (req, res) => {
-  res.status(200).send("Smart Parking Service is LIVE on Back4App!");
+  res.status(200).send("Smart Parking Service is LIVE on Railway!");
 });
 
 // ======================================================
@@ -67,7 +68,7 @@ async function startRabbitMQ() {
           const data = JSON.parse(message.toString());
           console.log(`📥 [WS] Data masuk. Slot yang dikirim: ${data.slots ? data.slots.length : 0}`);
           
-          // Melempar payload ESP32 langsung ke RabbitMQ
+          // Lempar data mentah ke RabbitMQ
           channel.sendToQueue(QUEUE, Buffer.from(JSON.stringify(data)), { persistent: true });
         } catch (err) {
           console.error("❌ [WS] Invalid JSON dari ESP32:", err.message);
@@ -87,7 +88,6 @@ async function startRabbitMQ() {
         const data = JSON.parse(msg.content.toString());
         
         if (data.slots && Array.isArray(data.slots)) {
-          // Mapping data dari payload JSON
           const payloadToDb = data.slots.map((slot) => ({
             parking_id: slot.parking_id,
             area_id: slot.area_id,
@@ -98,7 +98,6 @@ async function startRabbitMQ() {
             updated_at: new Date(),
           }));
 
-          // Eksekusi Bulk Upsert ke Supabase
           const { error } = await supabase.from("parking_slots").upsert(payloadToDb, {
             onConflict: "parking_id,area_id,level_id,zone_id,slot_number",
           });
@@ -110,11 +109,10 @@ async function startRabbitMQ() {
           }
         }
         
-        // Tandai pesan sudah diproses agar dihapus dari antrean
         channel.ack(msg);
       } catch (err) {
         console.error("❌ [Worker] Gagal memproses pesan:", err.message);
-        channel.ack(msg); // Tetap di-ack agar antrean tidak macet/looping
+        channel.ack(msg); 
       }
     });
 
@@ -133,9 +131,9 @@ process.on("unhandledRejection", (reason) => console.error("🔥 [CRITICAL] Unha
 // ======================================================
 // EKSEKUSI SERVER
 // ======================================================
-// Back4App merekomendasikan penggunaan variabel environment PORT (Biasanya 3000)
+// Railway secara otomatis akan memasukkan port ke dalam process.env.PORT
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server HTTP berjalan aman di port ${PORT}`);
+  console.log(`🚀 Server HTTP berjalan stabil di port ${PORT}`);
   startRabbitMQ();
 });
