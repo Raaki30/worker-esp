@@ -6,60 +6,85 @@ const { WebSocketServer } = require("ws");
 const amqp = require("amqplib");
 const { createClient } = require("@supabase/supabase-js");
 
-// NAMA QUEUE SUDAH DISESUAIKAN
+// Nama antrean sesuai instruksi
 const QUEUE = "parking_queue"; 
 
-// 1. Inisialisasi Express & WebSocket
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Supabase client
+// Inisialisasi Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-// Endpoint Health Check (Sangat penting agar Railway tidak mematikan container)
+// Middleware untuk memantau traffic HTTP yang masuk (Healthcheck Railway)
+app.use((req, res, next) => {
+  console.log(`[HTTP] Request masuk: ${req.method} ${req.url}`);
+  next();
+});
+
+// Endpoint Utama (Wajib merespons 200 OK agar container tidak di-stop)
 app.get("/", (req, res) => {
-  res.send("Smart Parking WebSockets & Worker Service is Running!");
+  res.status(200).send("Smart Parking WebSockets & Worker Service is Running!");
 });
 
 // ======================================================
-// FUNGSI KONEKSI RABBITMQ & WORKER (JALAN DI BACKGROUND)
+// LOGIKA UTAMA: RABBITMQ & WEBSOCKET
 // ======================================================
 async function startRabbitMQ() {
   try {
-    console.log("Menghubungkan ke RabbitMQ...");
+    console.log("[RabbitMQ] Mencoba menghubungkan ke broker...");
     const connection = await amqp.connect(process.env.RABBITMQ_URL);
+    
+    // Penangkap error internal pada koneksi RabbitMQ agar tidak memicu fatal crash
+    connection.on("error", (err) => {
+      console.error("🔥 [RabbitMQ] Connection Error:", err.message);
+    });
+    
+    connection.on("close", () => {
+      console.warn("⚠️ [RabbitMQ] Koneksi terputus! Mencoba menghubungkan ulang dalam 5 detik...");
+      setTimeout(startRabbitMQ, 5000);
+    });
+
     const channel = await connection.createChannel();
-
     await channel.assertQueue(QUEUE, { durable: true });
-    console.log(`✅ RabbitMQ Connected to queue: ${QUEUE}`);
+    console.log(`✅ [RabbitMQ] Berhasil terhubung ke queue: ${QUEUE}`);
 
-    // --- WEBSOCKET LISTENER (Menerima dari ESP32) ---
+    // --- BAGIAN A: MENERIMA DATA DARI ESP32 (WEBSOCKET INBOUND) ---
     wss.on("connection", (ws, req) => {
-      console.log(`✅ [WebSocket] ESP32 Connected from ${req.socket.remoteAddress}`);
+      const ip = req.socket.remoteAddress;
+      console.log(`✅ [WebSocket] ESP32 terhubung dari IP: ${ip}`);
 
       ws.on("message", (message) => {
         try {
           const data = JSON.parse(message.toString());
-          console.log(`📥 [WS] Data received. Slots: ${data.slots ? data.slots.length : 0}`);
+          console.log(`📥 [WS] Data diterima. Jumlah slot: ${data.slots ? data.slots.length : 0}`);
 
+          // Teruskan payload mentah dari ESP32 ke dalam antrean RabbitMQ
           channel.sendToQueue(QUEUE, Buffer.from(JSON.stringify(data)), {
             persistent: true,
           });
+          console.log(`📤 [RabbitMQ] Payload berhasil dimasukkan ke queue [${QUEUE}]`);
+
         } catch (err) {
-          console.error("❌ [WebSocket] Invalid JSON:", err.message);
+          console.error("❌ [WebSocket] Gagal memproses JSON dari ESP32:", err.message);
         }
       });
 
-      ws.on("close", () => console.log("❌ [WebSocket] ESP32 Disconnected"));
-      ws.on("error", (error) => console.error("⚠️ [WebSocket] Error:", error));
+      ws.on("close", () => {
+        console.log("❌ [WebSocket] ESP32 terputus (Koneksi tertutup)");
+      });
+
+      ws.on("error", (error) => {
+        console.error("⚠️ [WebSocket] Terjadi error pada socket:", error.message);
+      });
     });
 
-    // --- WORKER CONSUMER (Menyimpan ke Supabase) ---
-    console.log(`👷 Worker siap mendengarkan antrean: ${QUEUE}...`);
+    // --- BAGIAN B: WORKER CONSUMER (FORWARD DATA KE SUPABASE) ---
+    console.log(`👷 [Worker] Standby mendengarkan antrean: ${QUEUE}...`);
+    
     channel.consume(QUEUE, async (msg) => {
       if (!msg) return;
 
@@ -67,6 +92,7 @@ async function startRabbitMQ() {
         const data = JSON.parse(msg.content.toString());
         
         if (data.slots && Array.isArray(data.slots)) {
+          // Mapping data array untuk Bulk Upsert ke Supabase
           const payloadToDb = data.slots.map((slot) => ({
             parking_id: slot.parking_id,
             area_id: slot.area_id,
@@ -77,6 +103,7 @@ async function startRabbitMQ() {
             updated_at: new Date(),
           }));
 
+          // Eksekusi Bulk Upsert ke tabel parking_slots
           const { error } = await supabase
             .from("parking_slots")
             .upsert(payloadToDb, {
@@ -84,45 +111,49 @@ async function startRabbitMQ() {
             });
 
           if (error) {
-            console.error("❌ [Supabase] Error:", error.message);
+            console.error("❌ [Supabase] Gagal menyimpan data:", error.message);
           } else {
-            console.log(`✅ [Supabase] Updated ${payloadToDb.length} slots`);
+            console.log(`✅ [Supabase] Database berhasil diperbarui: ${payloadToDb.length} slot`);
           }
+        } else {
+          console.warn("⚠️ [Worker] Format payload tidak valid. Array 'slots' tidak ditemukan.");
         }
+
+        // Acknowledge pesan agar dihapus dari antrean RabbitMQ
         channel.ack(msg);
+
       } catch (err) {
-        console.error("❌ [Worker] Error:", err.message);
+        console.error("❌ [Worker] Gagal memproses pesan antrean:", err.message);
+        // Tetap di-ack jika JSON corrupt agar antrean tidak macet bergulung terus
         channel.ack(msg); 
       }
     });
 
   } catch (err) {
-    console.error("🔥 RabbitMQ Connection Error:", err.message);
-    // Coba ulang koneksi RabbitMQ setelah 5 detik jika terputus
+    console.error("🔥 [RabbitMQ] Gagal inisialisasi awal:", err.message);
+    // Coba hubungkan ulang jika setup awal gagal
     setTimeout(startRabbitMQ, 5000);
   }
 }
 
 // ======================================================
-// JALANKAN SERVER EXPRESS TERLEBIH DAHULU!
-// ======================================================
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server HTTP berjalan di port ${PORT}`);
-  
-  // Setelah server HTTP berhasil jalan, baru kita panggil RabbitMQ
-  startRabbitMQ();
-});
-
-// ======================================================
-// JARING PENGAMAN ANTI-CRASH (GLOBAL ERROR HANDLER)
+// JARING PENGAMAN GLOBAL (ANTI-STOPPING CONTAINER)
 // ======================================================
 process.on("uncaughtException", (err) => {
-  console.error("🔥 [CRITICAL] Uncaught Exception:", err.message);
-  // Jangan biarkan aplikasi mati
+  console.error("🔥 [CRITICAL_EXC] Uncaught Exception Terdeteksi:", err.message);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("🔥 [CRITICAL] Unhandled Rejection:", reason);
-  // Jangan biarkan aplikasi mati
+  console.error("🔥 [CRITICAL_REJ] Unhandled Rejection Terdeteksi:", reason);
+});
+
+// ======================================================
+// EKSEKUSI SERVER HTTP
+// ======================================================
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server HTTP berhasil berjalan di port ${PORT}`);
+  
+  // Menjalankan subsistem RabbitMQ setelah port HTTP dipastikan terbuka
+  startRabbitMQ();
 });
