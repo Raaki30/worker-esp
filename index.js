@@ -1,10 +1,18 @@
 require("dotenv").config();
 
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
 const amqp = require("amqplib");
 const { createClient } = require("@supabase/supabase-js");
 
-// NAMA QUEUE DISAMAKAN DENGAN WEBSOCKET SERVER
+// Nama antrean RabbitMQ
 const QUEUE = "parking_queue"; 
+
+// Inisialisasi Express & WebSocket Server (Agar Railway meng-expose port)
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
 // Supabase client
 const supabase = createClient(
@@ -12,37 +20,60 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-async function startWorker() {
+async function startService() {
   try {
     console.log("Connecting to RabbitMQ...");
 
-    // Connect RabbitMQ
-    const connection = await amqp.connect(
-      process.env.RABBITMQ_URL
-    );
-
+    // 1. Connect RabbitMQ
+    const connection = await amqp.connect(process.env.RABBITMQ_URL);
     const channel = await connection.createChannel();
 
     // Create queue if not exists
-    await channel.assertQueue(QUEUE, {
-      durable: true,
+    await channel.assertQueue(QUEUE, { durable: true });
+    console.log("✅ RabbitMQ Connected!");
+
+    // ======================================================
+    // BAGIAN 1: WEBSOCKET SERVER (MENERIMA DARI ESP32)
+    // ======================================================
+    wss.on("connection", (ws, req) => {
+      console.log(`✅ [WebSocket] ESP32 Connected from ${req.socket.remoteAddress}`);
+
+      ws.on("message", (message) => {
+        try {
+          const data = JSON.parse(message.toString());
+          console.log(`📥 [WS] Data received from ESP32. Slots: ${data.slots ? data.slots.length : 0}`);
+
+          // Publish data mentah dari ESP32 langsung ke RabbitMQ
+          channel.sendToQueue(QUEUE, Buffer.from(JSON.stringify(data)), {
+            persistent: true,
+          });
+          console.log("📤 [RabbitMQ] Data pushed to queue.");
+
+        } catch (err) {
+          console.error("❌ [WebSocket] Invalid JSON from ESP32:", err.message);
+        }
+      });
+
+      ws.on("close", () => {
+        console.log("❌ [WebSocket] ESP32 Disconnected");
+      });
+      
+      ws.on("error", (error) => {
+        console.error("⚠️ [WebSocket] Error:", error);
+      });
     });
 
-    console.log("Worker running...");
-    console.log(`Waiting for messages in queue: ${QUEUE}`);
-
-    // Consume queue
+    // ======================================================
+    // BAGIAN 2: WORKER (MENGAMBIL DARI RABBITMQ KE SUPABASE)
+    // ======================================================
+    console.log(`👷 Worker is waiting for messages in queue: ${QUEUE}...`);
     channel.consume(QUEUE, async (msg) => {
       if (!msg) return;
 
       try {
-        // Parse incoming message
         const data = JSON.parse(msg.content.toString());
-        console.log("Incoming message slots count:", data.slots ? data.slots.length : 0);
-
-        // Pastikan format JSON dari ESP32 benar (memiliki array 'slots')
+        
         if (data.slots && Array.isArray(data.slots)) {
-          
           // Mapping data array untuk Bulk Upsert
           const payloadToDb = data.slots.map((slot) => ({
             parking_id: slot.parking_id,
@@ -62,32 +93,42 @@ async function startWorker() {
             });
 
           if (error) {
-            console.error("❌ Supabase error:", error);
+            console.error("❌ [Supabase] Insert Error:", error);
           } else {
-            console.log(`✅ Database updated successfully: ${payloadToDb.length} slots`);
+            console.log(`✅ [Supabase] Database updated successfully: ${payloadToDb.length} slots`);
           }
-          
         } else {
           console.warn("⚠️ Invalid payload format. 'slots' array is missing.");
         }
 
-        // Acknowledge message agar dihapus dari antrean RabbitMQ
+        // Acknowledge message agar dihapus dari antrean
         channel.ack(msg);
 
       } catch (err) {
-        console.error("Worker processing error:", err);
-        // Tetap acknowledge jika JSON corrupt agar antrean tidak macet
-        channel.ack(msg); 
+        console.error("❌ [Worker] Processing error:", err);
+        channel.ack(msg); // Tetap ack jika error agar antrean tidak macet/looping
       }
     });
 
-  } catch (err) {
-    console.error("Connection error:", err);
+    // ======================================================
+    // BAGIAN 3: START HTTP SERVER (UNTUK PORT RAILWAY)
+    // ======================================================
+    // Health Check Endpoint (Penting agar Railway tidak mematikan service)
+    app.get("/", (req, res) => {
+      res.send("Smart Parking WebSockets & Worker Service is Running!");
+    });
 
-    // Retry reconnect
-    setTimeout(startWorker, 5000);
+    const PORT = process.env.PORT || 3000;
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Server and WebSocket listening on port ${PORT}`);
+    });
+
+  } catch (err) {
+    console.error("🔥 Critical Error:", err);
+    // Retry reconnect setelah 5 detik
+    setTimeout(startService, 5000);
   }
 }
 
-// Start worker
-startWorker();
+// Jalankan Service
+startService();
