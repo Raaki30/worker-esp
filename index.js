@@ -72,22 +72,34 @@ async function startRabbitMQ() {
       try {
         const data = JSON.parse(msg.content.toString());
         if (data.slots && Array.isArray(data.slots)) {
-          const payloadToDb = data.slots.map((slot) => ({
-            parking_id: slot.parking_id,
-            area_id: slot.area_id,
-            level_id: slot.level_id,
-            zone_id: slot.zone_id,
-            slot_number: slot.slot_number,
-            is_filled: slot.is_filled,
-            updated_at: new Date(),
-          }));
-
-          const { error } = await supabase.from("parking_slots").upsert(payloadToDb, {
-            onConflict: "parking_id,area_id,level_id,zone_id,slot_number",
+          
+          // MENGGUNAKAN .update() UNTUK MENCEGAH PEMBUATAN ROW BARU
+          const updatePromises = data.slots.map((slot) => {
+            return supabase
+              .from("parking_slots")
+              .update({
+                is_filled: slot.is_filled,
+                updated_at: new Date(),
+              })
+              // .eq (equals) berfungsi sebagai pencari target baris yang ingin diedit
+              .eq("parking_id", slot.parking_id)
+              .eq("area_id", slot.area_id)
+              .eq("level_id", slot.level_id)
+              .eq("zone_id", slot.zone_id)
+              .eq("slot_number", slot.slot_number);
           });
 
-          if (error) console.error("❌ [Supabase] Error:", error.message);
-          else console.log(`✅ [Supabase] Updated ${payloadToDb.length} slot`);
+          // Eksekusi semua perintah update secara paralel
+          const results = await Promise.all(updatePromises);
+          
+          // Pengecekan error
+          const errors = results.filter((res) => res.error).map((res) => res.error);
+
+          if (errors.length > 0) {
+            console.error("❌ [Supabase] Error saat update baris:", errors[0].message);
+          } else {
+            console.log(`✅ [Supabase] Berhasil UPDATE (tanpa insert) ${data.slots.length} slot`);
+          }
         }
         channel.ack(msg);
       } catch (err) {
