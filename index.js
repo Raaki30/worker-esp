@@ -113,3 +113,16 @@ server.listen(PORT, "0.0.0.0", () => {
   // Setelah server HTTP berhasil jalan, baru kita panggil RabbitMQ
   startRabbitMQ();
 });
+
+// ======================================================
+// JARING PENGAMAN ANTI-CRASH (GLOBAL ERROR HANDLER)
+// ======================================================
+process.on("uncaughtException", (err) => {
+  console.error("🔥 [CRITICAL] Uncaught Exception:", err.message);
+  // Jangan biarkan aplikasi mati
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🔥 [CRITICAL] Unhandled Rejection:", reason);
+  // Jangan biarkan aplikasi mati
+});
