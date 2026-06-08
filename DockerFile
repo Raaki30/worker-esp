@@ -1,20 +1,20 @@
-# Use the official Node.js image as the base image
+# 1. Gunakan versi Node.js yang ringan (Alpine Linux)
 FROM node:18-alpine
 
-# Set the working directory in the container
+# 2. Tentukan direktori kerja di dalam container
 WORKDIR /app
 
-# Copy package files
+# 3. Salin file konfigurasi package (package.json & package-lock.json)
 COPY package*.json ./
 
-# Install the application dependencies
-RUN npm ci --only=production
+# 4. Install semua dependensi (Express, ws, amqplib, supabase-js)
+RUN npm install --production
 
-# Copy the application files into the working directory
+# 5. Salin seluruh sisa kode aplikasi kamu ke dalam container
 COPY . .
 
-# Expose port (if needed)
+# 6. Ekspos port (Default Back4app / yang kita pakai di index.js)
 EXPOSE 3000
 
-# Define the entry point for the container
-CMD ["npm", "start"]
+# 7. Perintah wajib untuk menjalankan server
+CMD ["node", "index.js"]
