@@ -1,19 +1,19 @@
-# 1. Gunakan versi Node.js yang ringan (Alpine Linux)
-FROM node:18-alpine
+# 1. Gunakan versi Node.js 20 (Sesuai syarat Supabase terbaru)
+FROM node:20-alpine
 
 # 2. Tentukan direktori kerja di dalam container
 WORKDIR /app
 
-# 3. Salin file konfigurasi package (package.json & package-lock.json)
+# 3. Salin file konfigurasi package
 COPY package*.json ./
 
-# 4. Install semua dependensi (Express, ws, amqplib, supabase-js)
+# 4. Install semua dependensi
 RUN npm install --production
 
-# 5. Salin seluruh sisa kode aplikasi kamu ke dalam container
+# 5. Salin seluruh sisa kode aplikasi
 COPY . .
 
-# 6. Ekspos port (Default Back4app / yang kita pakai di index.js)
+# 6. Ekspos port
 EXPOSE 3000
 
 # 7. Perintah wajib untuk menjalankan server
